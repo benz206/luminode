@@ -5,4 +5,4 @@ edition = "2021"
 
 [dependencies]
 ws281x-rpi = "0.0.1"
-smart-leds-trait = "0.3"
+smart-leds-trait = "0.2.1"
