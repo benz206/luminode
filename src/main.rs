@@ -1,7 +1,7 @@
 use std::f32::consts::TAU;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
-use ws281x_rpi::{Controller, ControllerBuilder, ChannelBuilder};
+use ws281x_rpi::{ControllerBuilder, ChannelBuilder};
 
 const LED_COUNT: usize = 259;
 const FPS: u64 = 30;
