@@ -4,16 +4,12 @@ use smart_leds_trait::{SmartLedsWrite, RGB8};
 use ws281x_rpi::Ws2812Rpi;
 
 const LED_COUNT: usize = 259;
-const FPS: u64 = 30;
-const LOOP_SECONDS: u64 = 600;
+const FPS: u64 = 60;
 
 fn main() {
     let mut strip = Ws2812Rpi::new(LED_COUNT as i32, 18).unwrap();
 
     let hsv_lut = build_hsv_lut();
-
-    let bpm1 = 3.3_f64 / 60.0 * std::f64::consts::TAU;
-    let bpm2 = 4.7_f64 / 60.0 * std::f64::consts::TAU;
 
     let mut leds = vec![RGB8 { r: 0, g: 0, b: 0 }; LED_COUNT];
     let frame_duration = Duration::from_secs_f64(1.0 / FPS as f64);
@@ -21,15 +17,15 @@ fn main() {
     let start = Instant::now();
 
     loop {
-        let t = start.elapsed().as_secs_f64().rem_euclid(LOOP_SECONDS as f64);
+        let t = start.elapsed().as_secs_f64();
 
-        let start_hue = beatsin(bpm1, t);
-        let end_hue   = beatsin(bpm2, t);
+        let center_hue = (t * 8.0).rem_euclid(256.0);
+        let spread = 60.0 + 30.0 * (t * 0.3).sin();
 
         fill_gradient(
             &mut leds,
-            start_hue,
-            end_hue,
+            center_hue - spread,
+            center_hue + spread,
             &hsv_lut,
         );
 
@@ -42,11 +38,6 @@ fn main() {
         };
         sleep(next_frame_at.saturating_duration_since(now));
     }
-}
-
-#[inline(always)]
-fn beatsin(freq: f64, t: f64) -> f64 {
-    ((freq * t).sin() + 1.0) * 127.5
 }
 
 fn fill_gradient(
