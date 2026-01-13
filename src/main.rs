@@ -17,12 +17,11 @@ fn main() {
 
     let mut leds = vec![RGB8 { r: 0, g: 0, b: 0 }; LED_COUNT];
     let frame_duration = Duration::from_secs_f64(1.0 / FPS as f64);
-    let total_frames = LOOP_SECONDS * FPS;
     let mut next_frame_at = Instant::now();
-    let mut frame: u64 = 0;
+    let start = Instant::now();
 
     loop {
-        let t = (frame % total_frames) as f64 / FPS as f64;
+        let t = start.elapsed().as_secs_f64().rem_euclid(LOOP_SECONDS as f64);
 
         let start_hue = beatsin(bpm1, t);
         let end_hue   = beatsin(bpm2, t);
@@ -35,9 +34,13 @@ fn main() {
         );
 
         strip.write(leds.iter().copied()).unwrap();
-        frame = frame.wrapping_add(1);
-        next_frame_at += frame_duration;
-        sleep(next_frame_at.saturating_duration_since(Instant::now()));
+        let now = Instant::now();
+        next_frame_at = if next_frame_at <= now {
+            now + frame_duration
+        } else {
+            next_frame_at + frame_duration
+        };
+        sleep(next_frame_at.saturating_duration_since(now));
     }
 }
 
@@ -102,4 +105,3 @@ fn hsv_to_rgb(h: f32) -> RGB8 {
         _ => RGB8 { r: 255, g: 0, b: q as u8 },
     }
 }
-
