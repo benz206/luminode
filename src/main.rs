@@ -1,4 +1,3 @@
-use std::f32::consts::TAU;
 use std::thread::sleep;
 use std::time::{Duration, Instant};
 use smart_leds_trait::{SmartLedsWrite, RGB8};
@@ -6,21 +5,24 @@ use ws281x_rpi::Ws2812Rpi;
 
 const LED_COUNT: usize = 259;
 const FPS: u64 = 30;
+const LOOP_SECONDS: u64 = 600;
 
 fn main() {
     let mut strip = Ws2812Rpi::new(LED_COUNT as i32, 18).unwrap();
 
-    // Precompute HSV → RGB table
     let hsv_lut = build_hsv_lut();
 
-    let start = Instant::now();
-    let bpm1 = 3.3 / 60.0 * TAU;
-    let bpm2 = 4.7 / 60.0 * TAU;
+    let bpm1 = 3.3_f64 / 60.0 * std::f64::consts::TAU;
+    let bpm2 = 4.7_f64 / 60.0 * std::f64::consts::TAU;
 
     let mut leds = vec![RGB8 { r: 0, g: 0, b: 0 }; LED_COUNT];
+    let frame_duration = Duration::from_secs_f64(1.0 / FPS as f64);
+    let total_frames = LOOP_SECONDS * FPS;
+    let mut next_frame_at = Instant::now();
+    let mut frame: u64 = 0;
 
     loop {
-        let t = start.elapsed().as_secs_f32();
+        let t = (frame % total_frames) as f64 / FPS as f64;
 
         let start_hue = beatsin(bpm1, t);
         let end_hue   = beatsin(bpm2, t);
@@ -33,29 +35,47 @@ fn main() {
         );
 
         strip.write(leds.iter().copied()).unwrap();
-        sleep(Duration::from_millis(1000 / FPS));
+        frame = frame.wrapping_add(1);
+        next_frame_at += frame_duration;
+        sleep(next_frame_at.saturating_duration_since(Instant::now()));
     }
 }
 
 #[inline(always)]
-fn beatsin(freq: f32, t: f32) -> u8 {
-    (((freq * t).sin() + 1.0) * 127.5) as u8
+fn beatsin(freq: f64, t: f64) -> f64 {
+    ((freq * t).sin() + 1.0) * 127.5
 }
 
 fn fill_gradient(
     leds: &mut [RGB8],
-    start: u8,
-    end: u8,
+    start: f64,
+    end: f64,
     lut: &[RGB8; 256],
 ) {
-    let delta = end.wrapping_sub(start) as i16;
-    let step = delta as f32 / (leds.len() - 1) as f32;
-
-    let mut hue = start as f32;
+    let step = (end - start) / (leds.len() - 1) as f64;
+    let mut hue = start;
 
     for led in leds.iter_mut() {
-        *led = lut[hue as u8 as usize];
+        *led = sample_lut(hue, lut);
         hue += step;
+    }
+}
+
+#[inline(always)]
+fn sample_lut(hue: f64, lut: &[RGB8; 256]) -> RGB8 {
+    let h = hue.rem_euclid(256.0);
+    let h0 = h.floor();
+    let i0 = h0 as usize & 255;
+    let i1 = (i0 + 1) & 255;
+    let f = (h - h0) as f32;
+
+    let a = lut[i0];
+    let b = lut[i1];
+
+    RGB8 {
+        r: (a.r as f32 + (b.r as f32 - a.r as f32) * f).round() as u8,
+        g: (a.g as f32 + (b.g as f32 - a.g as f32) * f).round() as u8,
+        b: (a.b as f32 + (b.b as f32 - a.b as f32) * f).round() as u8,
     }
 }
 
