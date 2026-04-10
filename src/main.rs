@@ -314,7 +314,7 @@ fn try_refresh_token(auth: &mut SpotifyAuth, client_id: &str, path: &PathBuf) {
 
     match result {
         Ok(resp) => {
-            if let Ok(body) = resp.into_json::<serde_json::Value>() {
+            if let Ok(body) = serde_json::from_reader::<_, serde_json::Value>(resp.into_reader()) {
                 if let Some(at) = body["access_token"].as_str() {
                     auth.access_token = at.to_owned();
                 }
@@ -344,7 +344,7 @@ fn fetch_current_track(auth: &SpotifyAuth) -> Option<(String, u32, bool)> {
     match resp {
         Ok(r) if r.status() == 204 => None,
         Ok(r) => {
-            let body: serde_json::Value = r.into_json().ok()?;
+            let body: serde_json::Value = serde_json::from_reader(r.into_reader()).ok()?;
             if body["currently_playing_type"].as_str() != Some("track") {
                 return None;
             }
