@@ -9,17 +9,17 @@ use serde::{Deserialize, Serialize};
 
 const LED_COUNT: usize = 259;
 const FPS: u64 = 60;
-const POLL_SECS: u64 = 5;
+/// Poll every 2 s for tighter drift correction (beatmap is cached per-track).
+const POLL_SECS: u64 = 2;
 
-/// Beat-synced colour palette.  Each bar gets one colour from this list
-/// (cycling), applied as a punchy flash on every beat.
+/// Beat-synced colour palette — one colour per section kind.
 const PALETTE: [[u8; 3]; 6] = [
-    [0,   100, 255],  // electric blue
-    [255,   0, 180],  // hot magenta
-    [0,   220, 170],  // teal
-    [255, 160,   0],  // amber
-    [140,   0, 255],  // purple
-    [255,  80,  30],  // coral
+    [0,   100, 255],  // electric blue  (intro / bridge)
+    [255,   0, 180],  // hot magenta    (chorus)
+    [0,   220, 170],  // teal           (verse / outro)
+    [255, 160,   0],  // amber          (buildup)
+    [140,   0, 255],  // purple         (drop)
+    [255,  80,  30],  // coral          (breakdown)
 ];
 
 // ── Config ─────────────────────────────────────────────────────────────────────
@@ -32,7 +32,6 @@ struct Config {
 
 impl Config {
     fn load() -> Self {
-        // Load .env if it exists alongside the binary or in the current dir.
         let _ = dotenvy::dotenv();
         Config {
             luminode_url: std::env::var("LUMINODE_URL")
@@ -79,10 +78,8 @@ impl SpotifyAuth {
     }
 }
 
-// ── Beatmap (minimal deserialization) ─────────────────────────────────────────
+// ── Beatmap ────────────────────────────────────────────────────────────────────
 
-/// Minimal subset of the beatmap wire format needed for LED sync.
-/// rmp-serde skips any fields not declared here.
 #[derive(Deserialize)]
 struct RawBeatmap {
     timing: RawTiming,
@@ -107,30 +104,62 @@ struct RawSection {
     energy: u8,
 }
 
-/// Map a section kind string to a PALETTE index.
-fn section_palette_index(kind: &str) -> Option<usize> {
-    match kind {
-        "intro"     => Some(0), // electric blue — soft entrance
-        "verse"     => Some(2), // teal — calm sections
-        "chorus"    => Some(1), // hot magenta — high energy
-        "buildup"   => Some(3), // amber — building tension
-        "drop"      => Some(4), // purple — intense
-        "breakdown" => Some(5), // coral — breakdown
-        "bridge"    => Some(0), // electric blue
-        "outro"     => Some(2), // teal — winding down
-        _           => None,    // fallback: use bar index
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SectionKind {
+    Intro,
+    Verse,
+    Chorus,
+    Buildup,
+    Drop,
+    Breakdown,
+    Bridge,
+    Outro,
+    Unknown,
+}
+
+impl SectionKind {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "intro"     => SectionKind::Intro,
+            "verse"     => SectionKind::Verse,
+            "chorus"    => SectionKind::Chorus,
+            "buildup"   => SectionKind::Buildup,
+            "drop"      => SectionKind::Drop,
+            "breakdown" => SectionKind::Breakdown,
+            "bridge"    => SectionKind::Bridge,
+            "outro"     => SectionKind::Outro,
+            _           => SectionKind::Unknown,
+        }
+    }
+
+    fn palette_index(self) -> Option<usize> {
+        match self {
+            SectionKind::Intro     => Some(0),
+            SectionKind::Verse     => Some(2),
+            SectionKind::Chorus    => Some(1),
+            SectionKind::Buildup   => Some(3),
+            SectionKind::Drop      => Some(4),
+            SectionKind::Breakdown => Some(5),
+            SectionKind::Bridge    => Some(0),
+            SectionKind::Outro     => Some(2),
+            SectionKind::Unknown   => None,
+        }
     }
 }
 
+struct SectionEntry {
+    start_beat: usize,
+    end_beat: usize,
+    kind: SectionKind,
+    palette_index: usize,
+}
+
 struct BeatmapData {
-    /// Absolute beat timestamps (ms from track start).
     beat_times_ms: Vec<u32>,
-    /// Whether each beat is a downbeat (bar start).
     is_downbeat: Vec<bool>,
-    /// PALETTE index for each beat, driven by section kind (falls back to bar index).
     beat_palette_index: Vec<usize>,
-    /// Signed timing correction applied to all beat positions.
     calibration_ms: i32,
+    sections: Vec<SectionEntry>,
 }
 
 impl BeatmapData {
@@ -155,7 +184,6 @@ impl BeatmapData {
             })
             .collect();
 
-        // Compute bar index (used as fallback when no sections are available).
         let mut bar_index = vec![0usize; n];
         let mut bar = 0usize;
         for i in 0..n {
@@ -165,23 +193,30 @@ impl BeatmapData {
             bar_index[i] = bar;
         }
 
-        // Build a sorted list of (start_beat, palette_index) from sections.
-        // Sections missing from the plan fall back to None (use bar index).
-        let mut section_map: Vec<(usize, Option<usize>)> = raw.sections
+        // Build sorted section list with resolved end beats.
+        let mut raw_sections: Vec<(usize, SectionKind)> = raw.sections
             .iter()
-            .map(|s| (s.start_beat as usize, section_palette_index(&s.kind)))
+            .map(|s| (s.start_beat as usize, SectionKind::from_str(&s.kind)))
             .collect();
-        section_map.sort_by_key(|&(b, _)| b);
+        raw_sections.sort_by_key(|&(b, _)| b);
 
-        // For each beat, find the active section and assign a palette index.
+        let sections: Vec<SectionEntry> = raw_sections
+            .iter()
+            .enumerate()
+            .map(|(i, &(start_beat, kind))| {
+                let end_beat = raw_sections.get(i + 1).map(|&(b, _)| b).unwrap_or(n);
+                let palette_index = kind.palette_index()
+                    .unwrap_or_else(|| bar_index[start_beat.min(n - 1)] % PALETTE.len());
+                SectionEntry { start_beat, end_beat, kind, palette_index }
+            })
+            .collect();
+
         let beat_palette_index: Vec<usize> = (0..n)
             .map(|i| {
-                // Walk backwards to find the last section start ≤ i.
-                let active = section_map.iter().rev().find(|&&(sb, _)| sb <= i);
-                match active {
-                    Some(&(_, Some(pi))) => pi,
-                    _ => bar_index[i] % PALETTE.len(),
-                }
+                sections.iter().rev()
+                    .find(|s| s.start_beat <= i)
+                    .map(|s| s.palette_index)
+                    .unwrap_or_else(|| bar_index[i] % PALETTE.len())
             })
             .collect();
 
@@ -190,6 +225,7 @@ impl BeatmapData {
             is_downbeat,
             beat_palette_index,
             calibration_ms: raw.calibration_ms,
+            sections,
         }
     }
 }
@@ -200,11 +236,10 @@ impl BeatmapData {
 struct PlaybackState {
     track_id: Option<String>,
     is_playing: bool,
-    /// Playback position at the time of the last poll.
+    /// Spotify's reported progress at the time polled_at was captured.
     progress_ms: u32,
-    /// Wall-clock instant when progress_ms was captured.
+    /// Instant representing when progress_ms was accurate (≈ midpoint of RTT).
     polled_at: Option<Instant>,
-    /// Present when a beatmap for the current track was found.
     beatmap: Option<Arc<BeatmapData>>,
 }
 
@@ -229,10 +264,12 @@ struct BeatState {
     phase: f32,
     is_downbeat: bool,
     palette_index: usize,
+    section_kind: SectionKind,
+    /// How far into the current section: 0.0 = section start, 1.0 = section end.
+    section_phase: f32,
 }
 
 fn beat_state_at(bm: &BeatmapData, position_ms: u32) -> BeatState {
-    // Apply calibration offset.
     let pos = if bm.calibration_ms >= 0 {
         position_ms.saturating_sub(bm.calibration_ms as u32)
     } else {
@@ -256,44 +293,185 @@ fn beat_state_at(bm: &BeatmapData, position_ms: u32) -> BeatState {
     }
     .clamp(0.0, 1.0);
 
+    // Locate the active section and compute how far we are into it.
+    let (section_kind, section_phase) = bm.sections.iter().rev()
+        .find(|s| s.start_beat <= idx)
+        .map(|s| {
+            let span = (s.end_beat.saturating_sub(s.start_beat)).max(1) as f32;
+            let sp = (idx - s.start_beat) as f32 / span;
+            (s.kind, sp.clamp(0.0, 1.0))
+        })
+        .unwrap_or((SectionKind::Unknown, 0.0));
+
     BeatState {
         phase,
         is_downbeat: bm.is_downbeat[idx],
         palette_index: bm.beat_palette_index[idx],
+        section_kind,
+        section_phase,
     }
 }
 
 // ── Rendering ──────────────────────────────────────────────────────────────────
 
-/// Beat-synced flash: every beat punches in with the bar's colour, decays
-/// sharply, and downbeats get a white overlay for emphasis.
-fn fill_beat_synced(leds: &mut [RGB8], bs: &BeatState) {
-    let color = PALETTE[bs.palette_index];
-
-    // Envelope: instant attack, quadratic decay over the beat.
-    let flash: f32 = if bs.phase < 0.05 {
-        1.0
-    } else {
-        ((1.0 - bs.phase) * 1.4).max(0.0).powi(2)
-    };
-
-    // Downbeats add a white burst over the first 8% of the beat.
-    let white: f32 = if bs.is_downbeat && bs.phase < 0.08 {
-        (1.0 - bs.phase / 0.08) * 0.55
-    } else {
-        0.0
-    };
-
-    let r = (color[0] as f32 * flash + 255.0 * white).min(255.0) as u8;
-    let g = (color[1] as f32 * flash + 255.0 * white).min(255.0) as u8;
-    let b = (color[2] as f32 * flash + 255.0 * white).min(255.0) as u8;
-
+#[inline(always)]
+fn set_all(leds: &mut [RGB8], r: u8, g: u8, b: u8) {
     for led in leds.iter_mut() {
         *led = RGB8 { r, g, b };
     }
 }
 
-/// Original rainbow breathing — used when no beatmap is active.
+/// **Drop**: maximum-energy strobe — ultra-sharp attack, power-cube decay,
+/// white burst on every beat (not just downbeats).
+fn fill_drop(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    // Very fast decay: power-3 for extra snap.
+    let flash = if bs.phase < 0.03 {
+        1.0f32
+    } else {
+        ((1.0 - bs.phase) * 1.6).max(0.0).powi(3)
+    };
+    // White burst on every beat; stronger on downbeats.
+    let white_window = if bs.is_downbeat { 0.12 } else { 0.06 };
+    let white = if bs.phase < white_window {
+        let intensity = if bs.is_downbeat { 0.85 } else { 0.55 };
+        (1.0 - bs.phase / white_window) * intensity
+    } else {
+        0.0
+    };
+    set_all(
+        leds,
+        (c[0] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[1] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[2] as f32 * flash + 255.0 * white).min(255.0) as u8,
+    );
+}
+
+/// **Buildup**: intensity and sharpness escalate with section_phase (0 → 1),
+/// conveying mounting tension leading into the drop.
+fn fill_buildup(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    // Brightness floor rises 15 % → 60 % as buildup progresses.
+    let floor = 0.15 + 0.45 * bs.section_phase;
+    // Decay gets sharper (power 2 → 4).
+    let power = 2.0 + 2.0 * bs.section_phase as f64;
+    let decay = ((1.0 - bs.phase as f64) * 1.4).max(0.0).powf(power) as f32;
+    let flash = (decay + floor).min(1.0);
+    // Downbeat white burst also intensifies toward the end.
+    let white = if bs.is_downbeat && bs.phase < 0.1 {
+        (1.0 - bs.phase / 0.1) * (0.25 + 0.5 * bs.section_phase)
+    } else {
+        0.0
+    };
+    set_all(
+        leds,
+        (c[0] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[1] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[2] as f32 * flash + 255.0 * white).min(255.0) as u8,
+    );
+}
+
+/// **Chorus**: punchy standard beat-sync with an enhanced downbeat white burst.
+fn fill_chorus(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    let flash = if bs.phase < 0.05 {
+        1.0f32
+    } else {
+        ((1.0 - bs.phase) * 1.4).max(0.0).powi(2)
+    };
+    let white = if bs.is_downbeat && bs.phase < 0.10 {
+        (1.0 - bs.phase / 0.10) * 0.65
+    } else {
+        0.0
+    };
+    set_all(
+        leds,
+        (c[0] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[1] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[2] as f32 * flash + 255.0 * white).min(255.0) as u8,
+    );
+}
+
+/// **Verse**: gentle beat-sync at 70 % brightness — calm, steady.
+fn fill_verse(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    let flash = if bs.phase < 0.05 {
+        0.70f32
+    } else {
+        ((1.0 - bs.phase) * 1.0).max(0.0).powi(2) * 0.70
+    };
+    set_all(
+        leds,
+        (c[0] as f32 * flash).min(255.0) as u8,
+        (c[1] as f32 * flash).min(255.0) as u8,
+        (c[2] as f32 * flash).min(255.0) as u8,
+    );
+}
+
+/// **Breakdown**: slow sine-shaped breath — one long inhale/exhale per beat,
+/// minimal brightness, giving the strip a "resting" feel.
+fn fill_breakdown(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    let pulse = (std::f32::consts::PI * (1.0 - bs.phase)).sin() * 0.35 + 0.04;
+    set_all(
+        leds,
+        (c[0] as f32 * pulse).min(255.0) as u8,
+        (c[1] as f32 * pulse).min(255.0) as u8,
+        (c[2] as f32 * pulse).min(255.0) as u8,
+    );
+}
+
+/// **Intro / outro / bridge**: rainbow breathing with a very gentle beat accent.
+fn fill_soft(leds: &mut [RGB8], bs: &BeatState, t: f64, lut: &[RGB8; 256]) {
+    let center = (t * 6.0).rem_euclid(256.0);
+    let spread = 50.0 + 20.0 * (t * 0.25).sin();
+    fill_gradient(leds, center - spread, center + spread, lut);
+    // Slight brightness lift on each beat.
+    if bs.phase < 0.5 {
+        let boost = 1.0 + (1.0 - bs.phase * 2.0) * 0.25;
+        for led in leds.iter_mut() {
+            led.r = (led.r as f32 * boost).min(255.0) as u8;
+            led.g = (led.g as f32 * boost).min(255.0) as u8;
+            led.b = (led.b as f32 * boost).min(255.0) as u8;
+        }
+    }
+}
+
+/// **Default** beat-sync (unknown section kind — same as previous behaviour).
+fn fill_beat_synced(leds: &mut [RGB8], bs: &BeatState) {
+    let c = PALETTE[bs.palette_index];
+    let flash = if bs.phase < 0.05 {
+        1.0f32
+    } else {
+        ((1.0 - bs.phase) * 1.4).max(0.0).powi(2)
+    };
+    let white = if bs.is_downbeat && bs.phase < 0.08 {
+        (1.0 - bs.phase / 0.08) * 0.55
+    } else {
+        0.0
+    };
+    set_all(
+        leds,
+        (c[0] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[1] as f32 * flash + 255.0 * white).min(255.0) as u8,
+        (c[2] as f32 * flash + 255.0 * white).min(255.0) as u8,
+    );
+}
+
+/// Dispatch to the correct fill function based on section kind.
+fn fill_section(leds: &mut [RGB8], bs: &BeatState, t: f64, lut: &[RGB8; 256]) {
+    match bs.section_kind {
+        SectionKind::Drop                                                    => fill_drop(leds, bs),
+        SectionKind::Buildup                                                 => fill_buildup(leds, bs),
+        SectionKind::Chorus                                                  => fill_chorus(leds, bs),
+        SectionKind::Verse                                                   => fill_verse(leds, bs),
+        SectionKind::Breakdown                                               => fill_breakdown(leds, bs),
+        SectionKind::Intro | SectionKind::Outro | SectionKind::Bridge       => fill_soft(leds, bs, t, lut),
+        SectionKind::Unknown                                                 => fill_beat_synced(leds, bs),
+    }
+}
+
+/// Rainbow breathing — used when no beatmap is active or playback is paused.
 fn fill_rainbow_breathing(leds: &mut [RGB8], t: f64, lut: &[RGB8; 256]) {
     let center = (t * 8.0).rem_euclid(256.0);
     let spread = 60.0 + 30.0 * (t * 0.3).sin();
@@ -381,8 +559,13 @@ fn try_refresh_token(auth: &mut SpotifyAuth, client_id: &str, path: &PathBuf) {
     }
 }
 
-/// Returns (track_id, progress_ms, is_playing) or None.
-fn fetch_current_track(auth: &SpotifyAuth) -> Option<(String, u32, bool)> {
+/// Fetches currently-playing track.  Returns `(track_id, progress_ms,
+/// is_playing, polled_at)` where `polled_at` is the Instant corresponding to
+/// when `progress_ms` was accurate (≈ midpoint of the HTTP round-trip), so
+/// that the render thread's linear extrapolation stays phase-accurate.
+fn fetch_current_track(auth: &SpotifyAuth) -> Option<(String, u32, bool, Instant)> {
+    // Capture wall time before the request so we can bracket the latency.
+    let t0 = Instant::now();
     let resp = ureq::get("https://api.spotify.com/v1/me/player/currently-playing")
         .set("Authorization", &format!("Bearer {}", auth.access_token))
         .call();
@@ -391,13 +574,19 @@ fn fetch_current_track(auth: &SpotifyAuth) -> Option<(String, u32, bool)> {
         Ok(r) if r.status() == 204 => None,
         Ok(r) => {
             let body: serde_json::Value = serde_json::from_reader(r.into_reader()).ok()?;
+            // Measure total round-trip (including body) now that we have the data.
+            let rtt_ms = t0.elapsed().as_millis() as u64;
             if body["currently_playing_type"].as_str() != Some("track") {
                 return None;
             }
             let id = body["item"]["id"].as_str()?.to_owned();
-            let progress = body["progress_ms"].as_u64().unwrap_or(0) as u32;
+            let progress_ms = body["progress_ms"].as_u64().unwrap_or(0) as u32;
             let playing = body["is_playing"].as_bool().unwrap_or(false);
-            Some((id, progress, playing))
+            // The server generated progress_ms at ~t0 + rtt/2 (midpoint of RTT).
+            // Storing polled_at = t0 + rtt/2 means elapsed() gives the correct
+            // extrapolation offset with no further adjustment.
+            let polled_at = t0 + Duration::from_millis(rtt_ms / 2);
+            Some((id, progress_ms, playing, polled_at))
         }
         Err(e) => {
             eprintln!("[spotify] poll error: {}", e);
@@ -406,7 +595,6 @@ fn fetch_current_track(auth: &SpotifyAuth) -> Option<(String, u32, bool)> {
     }
 }
 
-/// Fetches and parses a beatmap from the luminode-sync API.
 fn fetch_beatmap(base_url: &str, track_id: &str) -> Option<Arc<BeatmapData>> {
     let url = format!("{}/beatmap/{}", base_url, track_id);
     let resp = ureq::get(&url).call();
@@ -417,7 +605,12 @@ fn fetch_beatmap(base_url: &str, track_id: &str) -> Option<Arc<BeatmapData>> {
             let raw: RawBeatmap = rmp_serde::from_slice(&bytes)
                 .map_err(|e| eprintln!("[beatmap] parse error for {}: {}", track_id, e))
                 .ok()?;
-            eprintln!("[beatmap] loaded {} beats for {}", raw.timing.beat_deltas_ms.len() + 1, track_id);
+            eprintln!(
+                "[beatmap] loaded {} beats, {} sections for {}",
+                raw.timing.beat_deltas_ms.len() + 1,
+                raw.sections.len(),
+                track_id
+            );
             Some(Arc::new(BeatmapData::from_raw(raw)))
         }
         Ok(r) if r.status() == 404 => {
@@ -449,7 +642,6 @@ fn poll_loop(config: Config, state: Arc<Mutex<PlaybackState>>) {
         }
     };
 
-    // Prefer SPOTIFY_CLIENT_ID env; fall back to what was saved in the token file.
     let client_id = if config.spotify_client_id.is_empty() {
         auth.client_id.clone().unwrap_or_default()
     } else {
@@ -470,7 +662,6 @@ fn poll_loop(config: Config, state: Arc<Mutex<PlaybackState>>) {
 
         match fetch_current_track(&auth) {
             None => {
-                // Nothing playing or not a track.
                 if last_track_id.is_some() {
                     eprintln!("[spotify] playback stopped");
                     last_track_id = None;
@@ -481,14 +672,12 @@ fn poll_loop(config: Config, state: Arc<Mutex<PlaybackState>>) {
                 g.beatmap = None;
             }
 
-            Some((track_id, progress_ms, is_playing)) => {
-                // Fetch beatmap only on track change (including first run).
+            Some((track_id, progress_ms, is_playing, polled_at)) => {
                 let beatmap = if last_track_id.as_deref() != Some(&track_id) {
                     eprintln!("[spotify] track: {}", track_id);
                     last_track_id = Some(track_id.clone());
                     fetch_beatmap(&config.luminode_url, &track_id)
                 } else {
-                    // Re-use existing beatmap from state (cheap Arc clone).
                     state.lock().unwrap().beatmap.clone()
                 };
 
@@ -496,7 +685,7 @@ fn poll_loop(config: Config, state: Arc<Mutex<PlaybackState>>) {
                 g.track_id = Some(track_id);
                 g.is_playing = is_playing;
                 g.progress_ms = progress_ms;
-                g.polled_at = Some(Instant::now());
+                g.polled_at = Some(polled_at);
                 g.beatmap = beatmap;
             }
         }
@@ -519,7 +708,6 @@ fn main() {
 
     let state: Arc<Mutex<PlaybackState>> = Arc::new(Mutex::new(PlaybackState::default()));
 
-    // Spotify + beatmap polling thread.
     {
         let state = Arc::clone(&state);
         thread::spawn(move || poll_loop(config, state));
@@ -528,7 +716,6 @@ fn main() {
     loop {
         let t = start.elapsed().as_secs_f64();
 
-        // Snapshot just enough state to render — hold the lock as briefly as possible.
         let (playing, pos_ms, beatmap) = {
             let g = state.lock().unwrap();
             (g.is_playing, g.current_position_ms(), g.beatmap.clone())
@@ -537,7 +724,7 @@ fn main() {
         if playing {
             if let Some(ref bm) = beatmap {
                 let bs = beat_state_at(bm, pos_ms);
-                fill_beat_synced(&mut leds, &bs);
+                fill_section(&mut leds, &bs, t, &hsv_lut);
             } else {
                 fill_rainbow_breathing(&mut leds, t, &hsv_lut);
             }
