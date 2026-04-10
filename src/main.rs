@@ -88,6 +88,8 @@ struct RawBeatmap {
     timing: RawTiming,
     #[serde(default)]
     calibration_ms: i32,
+    #[serde(default)]
+    sections: Vec<RawSection>,
 }
 
 #[derive(Deserialize)]
@@ -97,13 +99,36 @@ struct RawTiming {
     downbeat_bits: Vec<u8>,
 }
 
+#[derive(Deserialize)]
+struct RawSection {
+    start_beat: u16,
+    kind: String,
+    #[allow(dead_code)]
+    energy: u8,
+}
+
+/// Map a section kind string to a PALETTE index.
+fn section_palette_index(kind: &str) -> Option<usize> {
+    match kind {
+        "intro"     => Some(0), // electric blue — soft entrance
+        "verse"     => Some(2), // teal — calm sections
+        "chorus"    => Some(1), // hot magenta — high energy
+        "buildup"   => Some(3), // amber — building tension
+        "drop"      => Some(4), // purple — intense
+        "breakdown" => Some(5), // coral — breakdown
+        "bridge"    => Some(0), // electric blue
+        "outro"     => Some(2), // teal — winding down
+        _           => None,    // fallback: use bar index
+    }
+}
+
 struct BeatmapData {
     /// Absolute beat timestamps (ms from track start).
     beat_times_ms: Vec<u32>,
     /// Whether each beat is a downbeat (bar start).
     is_downbeat: Vec<bool>,
-    /// Bar index for each beat (0, 0, 0, 0, 1, 1, 1, 1, …).
-    beat_bar_index: Vec<usize>,
+    /// PALETTE index for each beat, driven by section kind (falls back to bar index).
+    beat_palette_index: Vec<usize>,
     /// Signed timing correction applied to all beat positions.
     calibration_ms: i32,
 }
@@ -130,19 +155,40 @@ impl BeatmapData {
             })
             .collect();
 
-        let mut beat_bar_index = vec![0usize; n];
+        // Compute bar index (used as fallback when no sections are available).
+        let mut bar_index = vec![0usize; n];
         let mut bar = 0usize;
         for i in 0..n {
             if i > 0 && is_downbeat[i] {
                 bar += 1;
             }
-            beat_bar_index[i] = bar;
+            bar_index[i] = bar;
         }
+
+        // Build a sorted list of (start_beat, palette_index) from sections.
+        // Sections missing from the plan fall back to None (use bar index).
+        let mut section_map: Vec<(usize, Option<usize>)> = raw.sections
+            .iter()
+            .map(|s| (s.start_beat as usize, section_palette_index(&s.kind)))
+            .collect();
+        section_map.sort_by_key(|&(b, _)| b);
+
+        // For each beat, find the active section and assign a palette index.
+        let beat_palette_index: Vec<usize> = (0..n)
+            .map(|i| {
+                // Walk backwards to find the last section start ≤ i.
+                let active = section_map.iter().rev().find(|&&(sb, _)| sb <= i);
+                match active {
+                    Some(&(_, Some(pi))) => pi,
+                    _ => bar_index[i] % PALETTE.len(),
+                }
+            })
+            .collect();
 
         BeatmapData {
             beat_times_ms,
             is_downbeat,
-            beat_bar_index,
+            beat_palette_index,
             calibration_ms: raw.calibration_ms,
         }
     }
@@ -182,7 +228,7 @@ struct BeatState {
     /// 0.0 = exactly on the beat, 1.0 = just before the next beat.
     phase: f32,
     is_downbeat: bool,
-    bar_index: usize,
+    palette_index: usize,
 }
 
 fn beat_state_at(bm: &BeatmapData, position_ms: u32) -> BeatState {
@@ -213,7 +259,7 @@ fn beat_state_at(bm: &BeatmapData, position_ms: u32) -> BeatState {
     BeatState {
         phase,
         is_downbeat: bm.is_downbeat[idx],
-        bar_index: bm.beat_bar_index[idx],
+        palette_index: bm.beat_palette_index[idx],
     }
 }
 
@@ -222,7 +268,7 @@ fn beat_state_at(bm: &BeatmapData, position_ms: u32) -> BeatState {
 /// Beat-synced flash: every beat punches in with the bar's colour, decays
 /// sharply, and downbeats get a white overlay for emphasis.
 fn fill_beat_synced(leds: &mut [RGB8], bs: &BeatState) {
-    let color = PALETTE[bs.bar_index % PALETTE.len()];
+    let color = PALETTE[bs.palette_index];
 
     // Envelope: instant attack, quadratic decay over the beat.
     let flash: f32 = if bs.phase < 0.05 {
